@@ -58,7 +58,7 @@ TNode<IntPtrT> StringBuiltinsAssembler::CallSearchStringRaw(
   const TNode<ExternalReference> function_addr = ExternalConstant(
       ExternalReference::search_string_raw<SubjectChar, PatternChar>());
   const TNode<ExternalReference> isolate_ptr =
-      ExternalConstant(ExternalReference::isolate_address(isolate()));
+      ExternalConstant(ExternalReference::isolate_address());
 
   MachineType type_ptr = MachineType::Pointer();
   MachineType type_intptr = MachineType::IntPtr();
@@ -935,6 +935,9 @@ TF_BUILTIN(StringGreaterThanOrEqual, StringBuiltinsAssembler) {
                                      StringComparison::kGreaterThanOrEqual);
 }
 
+#ifndef V8_ENABLE_EXPERIMENTAL_TSA_BUILTINS
+
+// NOTE: This needs to be kept in sync with the Turboshaft implementation.
 TF_BUILTIN(StringFromCodePointAt, StringBuiltinsAssembler) {
   auto receiver = Parameter<String>(Descriptor::kReceiver);
   auto position = UncheckedParameter<IntPtrT>(Descriptor::kPosition);
@@ -948,6 +951,8 @@ TF_BUILTIN(StringFromCodePointAt, StringBuiltinsAssembler) {
   TNode<String> result = StringFromSingleUTF16EncodedCodePoint(code);
   Return(result);
 }
+
+#endif  // V8_ENABLE_EXPERIMENTAL_TSA_BUILTINS
 
 // -----------------------------------------------------------------------------
 // ES6 section 21.1 String Objects
@@ -1470,8 +1475,7 @@ TNode<JSArray> StringBuiltinsAssembler::StringToArray(
 
     // The extracted direct string may be two-byte even though the wrapping
     // string is one-byte.
-    GotoIfNot(IsOneByteStringInstanceType(to_direct.instance_type()),
-              &call_runtime);
+    GotoIfNot(to_direct.IsOneByte(), &call_runtime);
 
     TNode<FixedArray> elements =
         CAST(AllocateFixedArray(PACKED_ELEMENTS, length));
@@ -1857,13 +1861,12 @@ void StringBuiltinsAssembler::CopyStringCharacters(
 // 0 <= |from_index| <= |from_index| + |character_count| < from_string.length.
 template <typename T>
 TNode<String> StringBuiltinsAssembler::AllocAndCopyStringCharacters(
-    TNode<T> from, TNode<Int32T> from_instance_type, TNode<IntPtrT> from_index,
+    TNode<T> from, TNode<BoolT> from_is_one_byte, TNode<IntPtrT> from_index,
     TNode<IntPtrT> character_count) {
   Label end(this), one_byte_sequential(this), two_byte_sequential(this);
   TVARIABLE(String, var_result);
 
-  Branch(IsOneByteStringInstanceType(from_instance_type), &one_byte_sequential,
-         &two_byte_sequential);
+  Branch(from_is_one_byte, &one_byte_sequential, &two_byte_sequential);
 
   // The subject string is a sequential one-byte string.
   BIND(&one_byte_sequential);
@@ -1996,7 +1999,7 @@ TNode<String> StringBuiltinsAssembler::SubString(TNode<String> string,
 
   TNode<String> direct_string = to_direct.TryToDirect(&runtime);
   TNode<IntPtrT> offset = IntPtrAdd(from, to_direct.offset());
-  const TNode<Int32T> instance_type = to_direct.instance_type();
+  const TNode<BoolT> is_one_byte = to_direct.IsOneByte();
 
   // The subject string can only be external or sequential string of either
   // encoding at this point.
@@ -2012,8 +2015,7 @@ TNode<String> StringBuiltinsAssembler::SubString(TNode<String> string,
 
       // Allocate new sliced string.
       Label one_byte_slice(this), two_byte_slice(this);
-      Branch(IsOneByteStringInstanceType(to_direct.instance_type()),
-             &one_byte_slice, &two_byte_slice);
+      Branch(is_one_byte, &one_byte_slice, &two_byte_slice);
 
       BIND(&one_byte_slice);
       {
@@ -2038,7 +2040,7 @@ TNode<String> StringBuiltinsAssembler::SubString(TNode<String> string,
     // encoding at this point.
     GotoIf(to_direct.is_external(), &external_string);
 
-    var_result = AllocAndCopyStringCharacters(direct_string, instance_type,
+    var_result = AllocAndCopyStringCharacters(direct_string, is_one_byte,
                                               offset, substr_length);
     Goto(&end);
   }
@@ -2050,7 +2052,7 @@ TNode<String> StringBuiltinsAssembler::SubString(TNode<String> string,
         to_direct.PointerToString(&runtime);
 
     var_result = AllocAndCopyStringCharacters(
-        fake_sequential_string, instance_type, offset, substr_length);
+        fake_sequential_string, is_one_byte, offset, substr_length);
 
     Goto(&end);
   }

@@ -4,6 +4,7 @@
 
 #include "src/maglev/maglev-assembler.h"
 
+#include "src/builtins/builtins-inl.h"
 #include "src/maglev/maglev-assembler-inl.h"
 #include "src/maglev/maglev-code-generator.h"
 #include "src/numbers/conversions.h"
@@ -118,6 +119,21 @@ void MaglevAssembler::JumpIfUndetectable(Register object, Register scratch,
   TestInt32AndJumpIfAnySet(scratch, Map::Bits1::IsUndetectableBit::kMask,
                            target, distance);
   bind(&detectable);
+}
+
+void MaglevAssembler::JumpIfNotCallable(Register object, Register scratch,
+                                        CheckType check_type, Label* target,
+                                        Label::Distance distance) {
+  if (check_type == CheckType::kCheckHeapObject) {
+    JumpIfSmi(object, target, distance);
+  } else if (v8_flags.debug_code) {
+    AssertNotSmi(object);
+  }
+  LoadMap(scratch, object);
+  static_assert(Map::kBitFieldOffsetEnd + 1 - Map::kBitFieldOffset == 1);
+  LoadUnsignedField(scratch, FieldMemOperand(scratch, Map::kBitFieldOffset), 1);
+  TestInt32AndJumpIfAllClear(scratch, Map::Bits1::IsCallableBit::kMask, target,
+                             distance);
 }
 
 void MaglevAssembler::EnsureWritableFastElements(
@@ -515,6 +531,66 @@ void MaglevAssembler::CheckAndEmitDeferredWriteBarrier(
   bind(*done);
 }
 
+#ifdef V8_ENABLE_SANDBOX
+
+void MaglevAssembler::CheckAndEmitDeferredIndirectPointerWriteBarrier(
+    Register object, int offset, Register value,
+    RegisterSnapshot register_snapshot, IndirectPointerTag tag) {
+  ZoneLabelRef done(this);
+  Label* deferred_write_barrier = MakeDeferredCode(
+      [](MaglevAssembler* masm, ZoneLabelRef done, Register object, int offset,
+         Register value, RegisterSnapshot register_snapshot,
+         IndirectPointerTag tag) {
+        ASM_CODE_COMMENT_STRING(masm, "Write barrier slow path");
+
+        Register stub_object_reg =
+            IndirectPointerWriteBarrierDescriptor::ObjectRegister();
+        Register slot_reg =
+            IndirectPointerWriteBarrierDescriptor::SlotAddressRegister();
+        Register tag_reg =
+            IndirectPointerWriteBarrierDescriptor::IndirectPointerTagRegister();
+
+        RegList saved;
+        if (object != stub_object_reg &&
+            register_snapshot.live_registers.has(stub_object_reg)) {
+          saved.set(stub_object_reg);
+        }
+        if (register_snapshot.live_registers.has(slot_reg)) {
+          saved.set(slot_reg);
+        }
+        if (register_snapshot.live_registers.has(tag_reg)) {
+          saved.set(tag_reg);
+        }
+
+        __ PushAll(saved);
+
+        if (object != stub_object_reg) {
+          __ Move(stub_object_reg, object);
+          object = stub_object_reg;
+        }
+        __ SetSlotAddressForTaggedField(slot_reg, object, offset);
+        __ Move(tag_reg, tag);
+
+        SaveFPRegsMode const save_fp_mode =
+            !register_snapshot.live_double_registers.is_empty()
+                ? SaveFPRegsMode::kSave
+                : SaveFPRegsMode::kIgnore;
+
+        __ CallBuiltin(Builtins::IndirectPointerBarrier(save_fp_mode));
+
+        __ PopAll(saved);
+        __ Jump(*done);
+      },
+      done, object, offset, value, register_snapshot, tag);
+
+  AssertNotSmi(value);
+
+  JumpIfMarking(deferred_write_barrier);
+  bind(*done);
+}
+
+#endif  // V8_ENABLE_SANDBOX
+
 void MaglevAssembler::StoreTaggedFieldWithWriteBarrier(
     Register object, int offset, Register value,
     RegisterSnapshot register_snapshot, ValueIsCompressed value_is_compressed,
@@ -525,6 +601,19 @@ void MaglevAssembler::StoreTaggedFieldWithWriteBarrier(
       object, offset, value, register_snapshot, value_is_compressed,
       value_can_be_smi);
 }
+
+#ifdef V8_ENABLE_SANDBOX
+
+void MaglevAssembler::StoreTrustedPointerFieldWithWriteBarrier(
+    Register object, int offset, Register value,
+    RegisterSnapshot register_snapshot, IndirectPointerTag tag) {
+  AssertNotSmi(object);
+  StoreTrustedPointerFieldNoWriteBarrier(object, offset, value);
+  CheckAndEmitDeferredIndirectPointerWriteBarrier(object, offset, value,
+                                                  register_snapshot, tag);
+}
+
+#endif  // V8_ENABLE_SANDBOX
 
 void MaglevAssembler::StoreFixedArrayElementWithWriteBarrier(
     Register array, Register index, Register value,
@@ -560,6 +649,34 @@ void MaglevAssembler::GenerateCheckConstTrackingLetCellFooter(Register context,
   // will update the side data and invalidate DependentCode if needed.
   CompareTaggedAndJumpIf(data, ConstTrackingLetCell::kNonConstMarker, kEqual,
                          done, Label::kNear);
+}
+
+void MaglevAssembler::TryMigrateInstance(Register object,
+                                         RegisterSnapshot& register_snapshot,
+                                         Label* fail) {
+  Register return_val = Register::no_reg();
+  {
+    SaveRegisterStateForCall save_register_state(this, register_snapshot);
+
+    Push(object);
+    Move(kContextRegister, native_context().object());
+    CallRuntime(Runtime::kTryMigrateInstance);
+    save_register_state.DefineSafepoint();
+
+    // Make sure the return value is preserved across the live register
+    // restoring pop all.
+    return_val = kReturnRegister0;
+    MaglevAssembler::ScratchRegisterScope temps(this);
+    Register scratch = temps.GetDefaultScratchRegister();
+    if (register_snapshot.live_registers.has(return_val)) {
+      DCHECK(!register_snapshot.live_registers.has(scratch));
+      Move(scratch, return_val);
+      return_val = scratch;
+    }
+  }
+
+  // On failure, the returned value is Smi zero.
+  CompareTaggedAndJumpIf(return_val, Smi::zero(), kEqual, fail);
 }
 
 }  // namespace maglev

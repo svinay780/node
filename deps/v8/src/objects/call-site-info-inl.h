@@ -26,6 +26,10 @@ BOOL_GETTER(CallSiteInfo, flags, IsWasm, IsWasmBit::kShift)
 BOOL_GETTER(CallSiteInfo, flags, IsAsmJsWasm, IsAsmJsWasmBit::kShift)
 BOOL_GETTER(CallSiteInfo, flags, IsAsmJsAtNumberConversion,
             IsAsmJsAtNumberConversionBit::kShift)
+#if V8_ENABLE_DRUMBRAKE
+BOOL_GETTER(CallSiteInfo, flags, IsWasmInterpretedFrame,
+            IsWasmInterpretedFrameBit::kShift)
+#endif  // V8_ENABLE_DRUMBRAKE
 BOOL_GETTER(CallSiteInfo, flags, IsBuiltin, IsBuiltinBit::kShift)
 #endif  // V8_ENABLE_WEBASSEMBLY
 BOOL_GETTER(CallSiteInfo, flags, IsStrict, IsStrictBit::kShift)
@@ -50,7 +54,7 @@ void CallSiteInfo::set_code_object(Tagged<HeapObject> code,
   DCHECK(IsCode(code) || IsBytecodeArray(code) || IsUndefined(code));
   if (IsCode(code) || IsBytecodeArray(code)) {
     WriteTrustedPointerField<kUnknownIndirectPointerTag>(
-        kCodeObjectOffset, ExposedTrustedObject::cast(code));
+        kCodeObjectOffset, Cast<ExposedTrustedObject>(code));
     CONDITIONAL_TRUSTED_POINTER_WRITE_BARRIER(
         *this, kCodeObjectOffset, kUnknownIndirectPointerTag, code, mode);
   } else {
